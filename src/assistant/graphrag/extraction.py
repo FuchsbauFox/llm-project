@@ -188,11 +188,15 @@ def _explicit_relations(text: str, entities: dict[str, Entity], names: dict[str,
 
     def code(raw: str, kind: str) -> Entity | None:
         value = canonical_name(kind, raw, names)
-        return Entity(kind, value) if value else None
+        if value:
+            return Entity(kind, value)
+        return None
 
     def named(raw: str, kind: str) -> Entity | None:
-        value = next((name for name in names.get(kind, []) if name.casefold() == raw.strip().casefold()), None)
-        return Entity(kind, value) if value else None
+        for name in names.get(kind, []):
+            if name and name.casefold() == raw.strip().casefold():
+                return Entity(kind, name)
+        return None
 
     membership = re.search(r"([A-Za-zА-Яа-я]+[- ]?\d{3})\s+входит в линейку\s*[«\"„“]([^»\"“”]+)[»\"“”]", text, re.I)
     if membership:

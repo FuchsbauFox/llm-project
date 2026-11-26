@@ -8,7 +8,7 @@ from itertools import combinations
 import networkx as nx
 
 from assistant.graphrag.communities import MISSING_SUMMARY, SUMMARY_PREFIX
-from assistant.graphrag.search_evidence import anchor_paths, community_facts, procedure_component
+from assistant.graphrag.search_evidence import anchor_paths, community_facts, discontinued_parts, procedure_component
 from assistant.infra.grounding import code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import MAP_SCHEMA, Answer, KnowledgeBase
@@ -18,6 +18,14 @@ ANSWER_SCHEMA = {
     "properties": {"answer": {"type": "string"}, "refused": {"type": "boolean"}},
     "required": ["answer", "refused"],
 }
+
+_MALFORMED_CODE = re.compile(
+    r"(?<![\w-])(?:AR|BZ|GS|SP|P|E)(?:--+\d{2,4}|-\d{1,4}-\d{1,4})[A-Z]?(?!\w)",
+    re.IGNORECASE,
+)
+_UNSUPPORTED_INSTALLATION = re.compile(
+    r"\bне\s+(?:устанавлива\w*|установлен\w*|ставится|применяется)\b", re.IGNORECASE
+)
 
 
 def _refusal() -> Answer:
@@ -57,6 +65,7 @@ def _explicit_refusal(text: str) -> bool:
     if conclusion and not affirmative:
         return True
     patterns = (
+        r"^вопрос\b[^.!?]{0,160}\bне\s+может\s+быть\s+(?:отвеч\w*|ответ\w*|реш\w*)\b",
         r"^(?:ответ:\s*)?(?:в базе знаний\s+)?(?:данных|сведений|информации)\s+"
         r"(?:недостаточно|не найдено|нет)\b",
         r"^данные\s+[^.!?]{0,160}\b(?:отсутствуют|не найдены)\b",
@@ -148,13 +157,187 @@ def _check_supplier(question: str, answer: Answer, kb: KnowledgeBase) -> Answer:
     return answer
 
 
+def _check_current_model_supplier(question: str, answer: Answer, kb: KnowledgeBase) -> Answer:
+    """Проверяет поставщика последней детали для указанной модели и узла."""
+    if answer.refused or "постав" not in question.lower():
+        return answer
+    if not re.search(r"сейчас|текущ|актуальн|замен", question.lower()):
+        return answer
+
+    models = [f"Model:{code}" for code in find_codes(question) if code_type(code) == "Model"]
+    components = [f"Component:{name}" for kind, name in find_names(question, kb.vocabulary) if kind == "Component"]
+    suppliers = [name for kind, name in find_names(answer.text, kb.vocabulary) if kind == "Supplier"]
+    if len(models) != 1 or len(components) != 1 or not suppliers or models[0] not in kb.graph:
+        return answer
+
+    graph = kb.graph
+    model, component = models[0], components[0]
+    installed = []
+    for part, edge in graph[model].items():
+        if edge.get("type") != "HAS_PART" or not graph.has_edge(part, component):
+            continue
+        if graph.edges[part, component].get("type") == "IS_A":
+            installed.append(part)
+    if len(installed) != 1:
+        return _refusal()
+
+    part = installed[0]
+    chain = [(model, part), (part, component)]
+    visited = set()
+    while part not in visited:
+        visited.add(part)
+        replacements = [target for target, edge in graph[part].items() if edge.get("type") == "REPLACED_BY"]
+        if not replacements:
+            break
+        if len(replacements) != 1:
+            return _refusal()
+        target = replacements[0]
+        chain.append((part, target))
+        part = target
+    else:
+        return _refusal()
+
+    supplier_edges = [(part, target) for target, edge in graph[part].items() if edge.get("type") == "SUPPLIED_BY"]
+    if len(supplier_edges) != 1:
+        return _refusal()
+    supplier_node = supplier_edges[0][1]
+    supplier_name = graph.nodes[supplier_node].get("name", supplier_node.split(":", 1)[-1])
+
+    # Используем только цепочку, уже включённую в факты local-поиска.
+    chain.append(supplier_edges[0])
+    facts = set(answer.facts)
+    for source, target in chain:
+        source_name = graph.nodes[source].get("name", source)
+        target_name = graph.nodes[target].get("name", target)
+        relation = graph.edges[source, target].get("type", "")
+        if f"{source_name} -{relation}-> {target_name}" not in facts:
+            return _refusal()
+
+    if all(name == supplier_name for name in suppliers):
+        return answer
+
+    part_name = graph.nodes[part].get("name", part.split(":", 1)[-1])
+    text = f"По данным графа актуальная деталь — {part_name}, её поставщик — {supplier_name}."
+    return Answer(text, answer.sources, answer.facts)
+
+
 def _check_codes(question: str, answer: Answer) -> Answer:
     if answer.refused:
         return answer
+    if _MALFORMED_CODE.search(answer.text):
+        return Answer("В базе знаний не найдено подтверждения указанного кода.", refused=True)
     supported = set(find_codes(question + "\n" + "\n".join(answer.facts)))
     if any(code not in supported for code in find_codes(answer.text)):
         return Answer("В базе знаний не найдено подтверждения указанного кода.", refused=True)
     return answer
+
+
+def has_unconfirmed_installation_claim(text: str) -> bool:
+    """Возвращает отрицательное утверждение, которое не выражается рёбрами графа."""
+    return bool(_UNSUPPORTED_INSTALLATION.search(text))
+
+
+def _filter_installation_claims(answer: Answer) -> Answer:
+    """В схеме нет отрицательных связей об установке деталей."""
+    if answer.refused or not has_unconfirmed_installation_claim(answer.text):
+        return answer
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", answer.text)
+    supported = [
+        sentence for sentence in sentences if sentence.strip() and not has_unconfirmed_installation_claim(sentence)
+    ]
+    if not supported:
+        return Answer("В базе знаний не найдено подтверждения для ответа.", answer.sources, answer.facts, True)
+    return Answer(" ".join(supported), answer.sources, answer.facts)
+
+
+def _check_replacements(question: str, answer: Answer) -> Answer:
+    """Проверяет актуальную деталь по выбранным фактам, а не по ответу модели."""
+    if answer.refused:
+        return answer
+    part_question = re.search(r"детал|запчаст|заказ|замен|актуальн|текущ", question, re.I)
+    recommendation = re.compile(
+        r"закаж\w*|заказ\w*|использ\w*|рекоменду\w*|установ(?:ить|ите)|"
+        r"постав(?:ить|ьте)|замен(?:ите|ить|и)\s+на", re.I
+    )
+    part_recommendation = recommendation.search(answer.text) or re.search(r"замен", answer.text, re.I)
+    if not part_question and not part_recommendation:
+        return answer
+    replacements: dict[str, set[str]] = defaultdict(set)
+    for fact in answer.facts:
+        match = re.fullmatch(r"(P-\d{4}[A-Z]?) -REPLACED_BY-> (P-\d{4}[A-Z]?)", fact)
+        if match:
+            replacements[match.group(1)].add(match.group(2))
+    if not replacements:
+        return answer
+
+    current_question = bool(re.search(r"заказ|замен|актуальн|текущ", question, re.I)) or bool(part_recommendation)
+    question_parts = {code for code in find_codes(question) if code in replacements}
+    answer_parts = {code for code in find_codes(answer.text) if code in replacements}
+    starts = question_parts or answer_parts
+    if not starts:
+        roots = set(replacements) - {target for targets in replacements.values() for target in targets}
+        has_model = any(code_type(code) == "Model" for code in find_codes(question))
+        if len(roots) != 1 or not has_model:
+            if current_question:
+                return Answer(
+                    "В базе знаний не удалось однозначно определить замену.", answer.sources, answer.facts, True
+                )
+            return answer
+        starts = roots
+
+    terminals = {}
+    for start in starts:
+        part = start
+        visited = set()
+        while part in replacements:
+            if part in visited or len(replacements[part]) != 1:
+                return Answer(
+                    "В базе знаний не удалось однозначно определить замену.", answer.sources, answer.facts, True
+                )
+            visited.add(part)
+            part = next(iter(replacements[part]))
+        terminals[start] = part
+
+    codes_in_answer = set(find_codes(answer.text))
+    missing = {start: end for start, end in terminals.items() if end not in codes_in_answer}
+    wrong_recommendation = False
+    if part_recommendation:
+        for match in recommendation.finditer(answer.text):
+            following = find_codes(answer.text[match.end() : match.end() + 80])
+            if following and following[0] in replacements:
+                wrong_recommendation = True
+                break
+        for part in replacements:
+            pattern = rf"\b{re.escape(part)}\s+(?:следует|нужно|необходимо)?\s*(?:заказ\w*|использ\w*|установить)"
+            if re.search(pattern, answer.text, re.I):
+                wrong_recommendation = True
+                break
+    if (current_question and "постав" not in question.lower() and missing) or wrong_recommendation:
+        choices = set(terminals.values())
+        if len(choices) != 1:
+            return Answer("В базе знаний не удалось однозначно определить замену.", answer.sources, answer.facts, True)
+        current = next(iter(choices))
+        return Answer(f"По данным графа актуальная деталь — {current}.", answer.sources, answer.facts)
+    if missing:
+        notes = " ".join(f"Замена детали {old} — {new}." for old, new in sorted(missing.items()))
+        return Answer(f"{answer.text} {notes}", answer.sources, answer.facts)
+    return answer
+
+
+def _repair_malformed_codes(question: str, answer: Answer, llm: LLMClient) -> Answer:
+    """Просит исправить неверный формат кода, не угадывая его самостоятельно."""
+    if answer.refused or not _MALFORMED_CODE.search(answer.text):
+        return answer
+    prompt = (
+        "В ответе неверно записан код. Исправь ответ по вопросу и фактам, не придумывая кодов. "
+        "Если данных недостаточно, верни refused=true. Верни JSON с полями answer и refused.\n"
+        f"Вопрос: {question}\nФакты:\n" + "\n".join(answer.facts) + f"\nОтвет: {answer.text}"
+    )
+    response = llm.chat([{"role": "user", "content": prompt}], json_schema=ANSWER_SCHEMA)
+    corrected = _model_answer(response.content, set(answer.sources), answer.facts)
+    if _MALFORMED_CODE.search(corrected.text):
+        return _refusal()
+    return corrected
 
 
 def _check_global_claims(answer: Answer) -> Answer:
@@ -195,7 +378,9 @@ def _check_global_procedures(question: str, answer: Answer, kb: KnowledgeBase) -
     edges = _selected_edges(answer)
     errors = {source for source, kind, target in edges if kind == "INDICATES" and target in components}
     supported = {target for source, kind, target in edges if kind == "FIXED_BY" and source in errors}
-    return answer if procedures <= supported else _refusal()
+    if procedures <= supported:
+        return answer
+    return _refusal()
 
 
 def _check_global_component_suppliers(question: str, answer: Answer, kb: KnowledgeBase) -> Answer:
@@ -232,7 +417,9 @@ def _check_global_component_suppliers(question: str, answer: Answer, kb: Knowled
     if re.search(r"сейчас|текущ|актуальн|замен", question.lower()):
         parts -= {source for source, kind, _ in edges if source in parts and kind == "REPLACED_BY"}
     supported = {target for source, kind, target in edges if source in parts and kind == "SUPPLIED_BY"}
-    return answer if suppliers <= supported else _refusal()
+    if suppliers <= supported:
+        return answer
+    return _refusal()
 
 
 def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
@@ -242,12 +429,14 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     code_nodes = [f"{code_type(code)}:{code}" for code in codes]
     if any(node not in graph for node in code_nodes):
         return _refusal()
-    anchors = list(code_nodes)
+    anchors = []
+    for node in code_nodes:
+        if node not in anchors:
+            anchors.append(node)
     for kind, name in find_names(question, kb.vocabulary):
         node = f"{kind}:{name}"
-        if node in graph:
+        if node in graph and node not in anchors:
             anchors.append(node)
-    anchors = list(dict.fromkeys(anchors))
     if not anchors:
         return _refusal()
 
@@ -315,7 +504,11 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     )
     response = llm.chat([{"role": "user", "content": prompt}], json_schema=ANSWER_SCHEMA)
     answer = _model_answer(response.content, sources, facts)
-    return _check_supplier(question, _check_codes(question, answer), kb)
+    answer = _repair_malformed_codes(question, answer, llm)
+    answer = _check_current_model_supplier(question, answer, kb)
+    answer = _check_supplier(question, _check_codes(question, answer), kb)
+    answer = _filter_installation_claims(answer)
+    return _check_replacements(question, answer)
 
 
 def _bundle_facts(facts: list[tuple[str, set[str]]]) -> list[tuple[str, set[str]]]:
@@ -394,6 +587,53 @@ def _reduce_prompt(question: str, partials: list[str]) -> str:
     return prompt
 
 
+def _map_prompt(
+    question: str,
+    summary: str,
+    facts: list[tuple[str, set[str]]],
+    paths: list[list[str]],
+    *,
+    comparison: bool,
+    statistic: bool,
+    procedure: bool,
+) -> str:
+    """Готовит вопрос модели по одному сообществу и его фактам."""
+    numbered = "\n".join(f"{i}: {fact}" for i, (fact, _) in enumerate(facts, 1)) or "нет"
+    prompt = (
+        "Выбери факты, которые помогают ответить на вопрос. Направление и типы сущностей важны: "
+        "Model — модель, Part — деталь; REPLACED_BY направлена от старой детали к новой. "
+        "Сравнивай только суммы FAILED, относящиеся к нужной линейке. "
+        "Верни JSON: answer — только номера выбранных фактов через запятую; score от 1 до 10. "
+        "Если подходящих фактов нет, верни пустой answer и score 0. Не придумывай номера.\n"
+        f"Вопрос: {question}\nСводка: {summary}\nПроверенные факты:\n{numbered}"
+    )
+    if comparison and any("сумма весов FAILED" in fact for fact, _ in facts):
+        prompt += "\nДля сравнения выбери все подходящие суммы, а не только наибольшую."
+        if statistic:
+            prompt += " Здесь единственный допустимый номер пакета — 1; выбери его целиком."
+    if paths and facts:
+        prompt += (
+            "\nЭти факты лежат на путях между сущностями вопроса или в цепочках замен деталей. "
+            "Здесь единственный допустимый номер пакета — 1; он обозначает все связи данного сообщества. "
+            "Выбери пакеты, необходимые для соединения сущностей и определения актуальной детали."
+        )
+        if "постав" in question.lower():
+            prompt += " В пакет также включены подтверждённые связи деталей с поставщиками."
+        prompt += (
+            "\nПути опор (порядок соседства, не направление связей):\n"
+            + "\n".join(" ↔ ".join(path) for path in paths)
+            + "\nПути служат только контекстом. Выбирай исключительно номера проверенных фактов этого "
+            "сообщества; если их нет, верни score 0."
+        )
+    elif procedure and facts:
+        prompt += (
+            "\nПакет содержит связи ошибки с указанным узлом и её регламентом. "
+            "Здесь единственный допустимый номер пакета — 1; выбери его целиком, "
+            "если он помогает ответить на вопрос."
+        )
+    return prompt
+
+
 def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     """Объединяет полезные ответы модели на отдельные сводки сообществ."""
     partials: list[str] = []
@@ -430,39 +670,15 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
                     available = _bundle_facts(selected)
                 else:
                     available = []
-            numbered = "\n".join(f"{i}: {fact}" for i, (fact, _) in enumerate(available, 1)) or "нет"
-            prompt = (
-                "Выбери факты, которые помогают ответить на вопрос. Направление и типы сущностей важны: "
-                "Model — модель, Part — деталь; REPLACED_BY направлена от старой детали к новой. "
-                "Сравнивай только суммы FAILED, относящиеся к нужной линейке. "
-                "Верни JSON: answer — только номера выбранных фактов через запятую; score от 1 до 10. "
-                "Если подходящих фактов нет, верни пустой answer и score 0. Не придумывай номера.\n"
-                f"Вопрос: {question}\nСводка: {community.summary}\nПроверенные факты:\n{numbered}"
+            prompt = _map_prompt(
+                question,
+                community.summary,
+                available,
+                paths,
+                comparison=bool(comparison),
+                statistic=bool(statistic),
+                procedure=procedure_search,
             )
-            if comparison and any("сумма весов FAILED" in fact for fact, _ in available):
-                prompt += "\nДля сравнения выбери все подходящие суммы, а не только наибольшую."
-                if statistic:
-                    prompt += " Здесь единственный допустимый номер пакета — 1; выбери его целиком."
-            if paths and available:
-                prompt += (
-                    "\nЭти факты лежат на путях между сущностями вопроса или в цепочках замен деталей. "
-                    "Здесь единственный допустимый номер пакета — 1; он обозначает все связи данного сообщества. "
-                    "Выбери пакеты, необходимые для соединения сущностей и определения актуальной детали."
-                )
-                if "постав" in question_lower:
-                    prompt += " В пакет также включены подтверждённые связи деталей с поставщиками."
-                prompt += (
-                    "\nПути опор (порядок соседства, не направление связей):\n"
-                    + "\n".join(" ↔ ".join(path) for path in paths)
-                    + "\nПути служат только контекстом. Выбирай исключительно номера проверенных фактов этого "
-                    "сообщества; если их нет, верни score 0."
-                )
-            elif procedure_search and available:
-                prompt += (
-                    "\nПакет содержит связи ошибки с указанным узлом и её регламентом. "
-                    "Здесь единственный допустимый номер пакета — 1; выбери его целиком, "
-                    "если он помогает ответить на вопрос."
-                )
         else:
             prompt = (
                 f"Ответь по сводке в JSON answer и score от 0 до 10.\nВопрос: {question}\nСводка: {community.summary}"
@@ -481,7 +697,11 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
             selected = answer.strip().strip("[]")
             if not re.fullmatch(r"\s*\d+(?:\s*[,;]\s*\d+)*\s*", selected):
                 continue
-            indices = list(dict.fromkeys(int(value) for value in re.findall(r"\d+", selected)))
+            indices = []
+            for value in re.findall(r"\d+", selected):
+                index = int(value)
+                if index not in indices:
+                    indices.append(index)
             for index in indices:
                 if 1 <= index <= len(available):
                     fact, documents = available[index - 1]
@@ -500,6 +720,12 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     prompt = _reduce_prompt(question, partials)
     response = llm.chat([{"role": "user", "content": prompt}], json_schema=ANSWER_SCHEMA)
     answer = _model_answer(response.content, sources, partials)
+    answer = _repair_malformed_codes(question, answer, llm)
+    parts, evidence_sources = discontinued_parts(question, kb, partials)
+    if parts:
+        text = "По подтверждённым документам сняты с производства: " + ", ".join(parts)
+        text += ". Перечень может быть неполным."
+        return Answer(text, sorted(sources | evidence_sources), partials)
     if all(_grounded_summary(community.summary) for community in kb.communities):
         answer = _check_global_claims(_check_codes(question, answer))
         answer = _check_global_procedures(question, answer, kb)

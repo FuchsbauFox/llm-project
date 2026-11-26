@@ -6,6 +6,9 @@ from itertools import combinations
 
 import networkx as nx
 
+from assistant.graphrag.extraction import _asserted_text
+from assistant.infra.chunking import load_chunks
+from assistant.infra.config import Settings
 from assistant.infra.grounding import code_type, find_codes, find_names
 from assistant.infra.schemas import KnowledgeBase
 
@@ -18,11 +21,56 @@ def _sources(*edges: dict) -> set[str]:
     return documents
 
 
+def discontinued_parts(question: str, kb: KnowledgeBase, facts: list[str]) -> tuple[list[str], set[str]]:
+    """Находит детали линейки, снятие которых прямо подтверждено текстом источника."""
+    if not re.search(r"снят[а-яё]*\s+с\s+производств", question.lower()):
+        return [], set()
+    lines = [f"ProductLine:{name}" for kind, name in find_names(question, kb.vocabulary) if kind == "ProductLine"]
+    if len(lines) != 1:
+        return [], set()
+
+    selected = "\n".join(facts)
+    graph = kb.graph
+    candidates = []
+    for model, line, membership in graph.edges(data=True):
+        if line != lines[0] or membership.get("type") != "BELONGS_TO":
+            continue
+        for part, installed in graph[model].items():
+            if installed.get("type") != "HAS_PART":
+                continue
+            for replacement, edge in graph[part].items():
+                if edge.get("type") != "REPLACED_BY":
+                    continue
+                if f"{part} -REPLACED_BY-> {replacement}" not in selected:
+                    continue
+                candidates.append((part, membership, installed, edge))
+    if not candidates:
+        return [], set()
+
+    chunks = {chunk.chunk_id: chunk.text for chunk in load_chunks(Settings.from_env().data_dir / "corpus")}
+    parts = set()
+    sources = set()
+    for part, membership, installed, replacement in candidates:
+        name = graph.nodes[part].get("name", part.split(":", 1)[-1])
+        pattern = rf"^\s*деталь\s+{re.escape(name)}\s*(?:\([^()\n]*\)\s*)?снят[а-яё]*\s+с\s+производства\."
+        for chunk_id in replacement.get("sources", []):
+            text = chunks.get(chunk_id, "")
+            if re.search(pattern, _asserted_text(text), re.IGNORECASE | re.MULTILINE):
+                parts.add(name)
+                sources.update(_sources(membership, installed))
+                sources.add(chunk_id.split("#", 1)[0])
+                break
+    return sorted(parts), sources
+
+
 def _anchors(question: str, kb: KnowledgeBase) -> list[str]:
-    anchors = [f"{code_type(code)}:{code}" for code in find_codes(question)]
-    anchors.extend(f"{kind}:{name}" for kind, name in find_names(question, kb.vocabulary))
-    existing = [node for node in anchors if node in kb.graph]
-    return list(dict.fromkeys(existing))
+    found = [f"{code_type(code)}:{code}" for code in find_codes(question)]
+    found.extend(f"{kind}:{name}" for kind, name in find_names(question, kb.vocabulary))
+    anchors = []
+    for node in found:
+        if node in kb.graph and node not in anchors:
+            anchors.append(node)
+    return anchors
 
 
 def procedure_component(question: str, kb: KnowledgeBase) -> str | None:
@@ -62,9 +110,33 @@ def anchor_paths(question: str, kb: KnowledgeBase) -> list[list[str]]:
     return paths
 
 
+def _add_replacements(graph, parts: list[str], edges: set[tuple[str, str]], *, suppliers: bool) -> None:
+    """Добавляет цепочки замен и, при необходимости, поставщиков этих деталей."""
+    pending = list(parts)
+    visited = set()
+    while pending:
+        part = pending.pop()
+        if part in visited:
+            continue
+        visited.add(part)
+        for target, edge in graph[part].items():
+            if edge.get("type") == "REPLACED_BY":
+                edges.add((part, target))
+                pending.append(target)
+            elif edge.get("type") == "SUPPLIED_BY" and suppliers:
+                edges.add((part, target))
+
+
 def _path_edges(question: str, kb: KnowledgeBase, anchors: list[str]) -> set[tuple[str, str]] | None:
     """Собирает связи на путях и связанные с ними замены и регламенты."""
     graph = kb.graph
+    if len(anchors) == 1 and anchors[0].startswith("Part:"):
+        # Для вопроса об одной детали не подмешиваем связи других деталей сообщества.
+        part = anchors[0]
+        edges = set(graph.in_edges(part)) | set(graph.out_edges(part))
+        _add_replacements(graph, [part], edges, suppliers="постав" in question.lower())
+        return edges
+
     if len(anchors) >= 2:
         edges = set()
         nodes = set()
@@ -76,19 +148,8 @@ def _path_edges(question: str, kb: KnowledgeBase, anchors: list[str]) -> set[tup
                 if graph.has_edge(second, first):
                     edges.add((second, first))
 
-        pending = [node for node in nodes if graph.nodes[node].get("type") == "Part"]
-        visited = set()
-        while pending:
-            part = pending.pop()
-            if part in visited:
-                continue
-            visited.add(part)
-            for target, edge in graph[part].items():
-                if edge.get("type") == "REPLACED_BY":
-                    edges.add((part, target))
-                    pending.append(target)
-                elif edge.get("type") == "SUPPLIED_BY" and "постав" in question.lower():
-                    edges.add((part, target))
+        parts = [node for node in nodes if graph.nodes[node].get("type") == "Part"]
+        _add_replacements(graph, parts, edges, suppliers="постав" in question.lower())
         return edges
 
     component = procedure_component(question, kb)

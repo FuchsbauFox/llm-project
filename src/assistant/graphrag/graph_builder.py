@@ -17,10 +17,10 @@ def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:
     graph = nx.DiGraph()
 
     for result in results:
+        valid_relations = [relation for relation in result.relations if relation.matches_schema()]
         entities = list(result.entities)
-        for relation in result.relations:
-            if relation.matches_schema():
-                entities.extend((relation.subject, relation.object))
+        for relation in valid_relations:
+            entities.extend((relation.subject, relation.object))
 
         for entity in entities:
             if entity.node_id not in graph:
@@ -30,10 +30,7 @@ def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:
             if result.chunk_id not in sources:
                 sources.append(result.chunk_id)
 
-        for relation in result.relations:
-            if not relation.matches_schema():
-                continue
-
+        for relation in valid_relations:
             subject = relation.subject.node_id
             target = relation.object.node_id
 

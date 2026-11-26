@@ -75,7 +75,7 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
             return "Некорректный номер детали"
         return None
 
-    def request(method, **arguments) -> dict:
+    def request_erp(method, **arguments) -> dict:
         try:
             return method(**arguments)
         except ErpNotFound as exc:
@@ -89,13 +89,13 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
             error = "Неизвестный склад"
         if error:
             return {"error": error}
-        return request(erp.get_stock, part_id=part_id, warehouse=warehouse)
+        return request_erp(erp.get_stock, part_id=part_id, warehouse=warehouse)
 
     def get_price(part_id: str) -> dict:
         error = validate_part(part_id)
         if error:
             return {"error": error}
-        return request(erp.get_price, part_id=part_id)
+        return request_erp(erp.get_price, part_id=part_id)
 
     def create_service_order(part_id: str, warehouse: str, qty: int, model: str) -> dict:
         error = validate_part(part_id)
@@ -107,7 +107,7 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
             error = "Не указана модель"
         if error:
             return {"error": error}
-        return request(erp.create_order, part_id=part_id, warehouse=warehouse, qty=qty, model=model)
+        return request_erp(erp.create_order, part_id=part_id, warehouse=warehouse, qty=qty, model=model)
 
     return {
         "search_knowledge": search_knowledge,
