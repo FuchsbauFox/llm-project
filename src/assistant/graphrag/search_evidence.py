@@ -1,0 +1,248 @@
+"""Факты для обзорного поиска и документы, подтверждающие каждый факт."""
+
+import re
+from collections import defaultdict
+from itertools import combinations
+
+import networkx as nx
+
+from assistant.graphrag.extraction import _asserted_text
+from assistant.infra.chunking import load_chunks
+from assistant.infra.config import Settings
+from assistant.infra.grounding import code_type, find_codes, find_names
+from assistant.infra.schemas import KnowledgeBase
+
+
+def _sources(*edges: dict) -> set[str]:
+    documents = set()
+    for edge in edges:
+        for chunk in edge.get("sources", []):
+            documents.add(chunk.split("#", 1)[0])
+    return documents
+
+
+def discontinued_parts(question: str, kb: KnowledgeBase, facts: list[str]) -> tuple[list[str], set[str]]:
+    """Находит детали линейки, снятие которых прямо подтверждено текстом источника."""
+    if not re.search(r"снят[а-яё]*\s+с\s+производств", question.lower()):
+        return [], set()
+    lines = [f"ProductLine:{name}" for kind, name in find_names(question, kb.vocabulary) if kind == "ProductLine"]
+    if len(lines) != 1:
+        return [], set()
+
+    selected = "\n".join(facts)
+    graph = kb.graph
+    candidates = []
+    for model, line, membership in graph.edges(data=True):
+        if line != lines[0] or membership.get("type") != "BELONGS_TO":
+            continue
+        for part, installed in graph[model].items():
+            if installed.get("type") != "HAS_PART":
+                continue
+            for replacement, edge in graph[part].items():
+                if edge.get("type") != "REPLACED_BY":
+                    continue
+                if f"{part} -REPLACED_BY-> {replacement}" not in selected:
+                    continue
+                candidates.append((part, membership, installed, edge))
+    if not candidates:
+        return [], set()
+
+    chunks = {chunk.chunk_id: chunk.text for chunk in load_chunks(Settings.from_env().data_dir / "corpus")}
+    parts = set()
+    sources = set()
+    for part, membership, installed, replacement in candidates:
+        name = graph.nodes[part].get("name", part.split(":", 1)[-1])
+        pattern = rf"^\s*деталь\s+{re.escape(name)}\s*(?:\([^()\n]*\)\s*)?снят[а-яё]*\s+с\s+производства\."
+        for chunk_id in replacement.get("sources", []):
+            text = chunks.get(chunk_id, "")
+            if re.search(pattern, _asserted_text(text), re.IGNORECASE | re.MULTILINE):
+                parts.add(name)
+                sources.update(_sources(membership, installed))
+                sources.add(chunk_id.split("#", 1)[0])
+                break
+    return sorted(parts), sources
+
+
+def _anchors(question: str, kb: KnowledgeBase) -> list[str]:
+    found = [f"{code_type(code)}:{code}" for code in find_codes(question)]
+    found.extend(f"{kind}:{name}" for kind, name in find_names(question, kb.vocabulary))
+    anchors = []
+    for node in found:
+        if node in kb.graph and node not in anchors:
+            anchors.append(node)
+    return anchors
+
+
+def procedure_component(question: str, kb: KnowledgeBase) -> str | None:
+    """Определяет вопрос о регламенте одного известного узла."""
+    anchors = _anchors(question, kb)
+    asks_about_procedure = re.search(r"регламент|процедур", question.lower())
+    if len(anchors) == 1 and anchors[0].startswith("Component:") and asks_about_procedure:
+        return anchors[0]
+    return None
+
+
+def anchor_paths(question: str, kb: KnowledgeBase) -> list[list[str]]:
+    """Находит короткие пути между известными опорами без учёта направления."""
+    undirected = kb.graph.to_undirected()
+    paths = []
+    anchors = _anchors(question, kb)
+    for start, end in combinations(anchors, 2):
+        paths.extend(nx.all_simple_paths(undirected, start, end, cutoff=3))
+
+    # Для поиска детали важна связь установленной детали с видом нужного узла.
+    # Пути через другие модели и общую линейку добавляют посторонние детали.
+    has_model = any(node.startswith("Model:") for node in anchors)
+    has_target = any(node.startswith(("Component:", "ErrorCode:")) for node in anchors)
+    if len(anchors) == 2 and has_model and has_target and re.search(r"детал|постав|заказ", question.lower()):
+        relevant = []
+        for path in paths:
+            kinds = set()
+            for first, second in zip(path, path[1:], strict=False):
+                if kb.graph.has_edge(first, second):
+                    kinds.add(kb.graph.edges[first, second].get("type"))
+                if kb.graph.has_edge(second, first):
+                    kinds.add(kb.graph.edges[second, first].get("type"))
+            if {"HAS_PART", "IS_A"} <= kinds:
+                relevant.append(path)
+        if relevant:
+            return relevant
+    return paths
+
+
+def _add_replacements(graph, parts: list[str], edges: set[tuple[str, str]], *, suppliers: bool) -> None:
+    """Добавляет цепочки замен и, при необходимости, поставщиков этих деталей."""
+    pending = list(parts)
+    visited = set()
+    while pending:
+        part = pending.pop()
+        if part in visited:
+            continue
+        visited.add(part)
+        for target, edge in graph[part].items():
+            if edge.get("type") == "REPLACED_BY":
+                edges.add((part, target))
+                pending.append(target)
+            elif edge.get("type") == "SUPPLIED_BY" and suppliers:
+                edges.add((part, target))
+
+
+def _path_edges(question: str, kb: KnowledgeBase, anchors: list[str]) -> set[tuple[str, str]] | None:
+    """Собирает связи на путях и связанные с ними замены и регламенты."""
+    graph = kb.graph
+    if len(anchors) == 1 and anchors[0].startswith("Part:"):
+        # Для вопроса об одной детали не подмешиваем связи других деталей сообщества.
+        part = anchors[0]
+        edges = set(graph.in_edges(part)) | set(graph.out_edges(part))
+        _add_replacements(graph, [part], edges, suppliers="постав" in question.lower())
+        return edges
+
+    if len(anchors) >= 2:
+        edges = set()
+        nodes = set()
+        for path in anchor_paths(question, kb):
+            nodes.update(path)
+            for first, second in zip(path, path[1:], strict=False):
+                if graph.has_edge(first, second):
+                    edges.add((first, second))
+                if graph.has_edge(second, first):
+                    edges.add((second, first))
+
+        parts = [node for node in nodes if graph.nodes[node].get("type") == "Part"]
+        _add_replacements(graph, parts, edges, suppliers="постав" in question.lower())
+        return edges
+
+    component = procedure_component(question, kb)
+    if not component:
+        return None
+    edges = set()
+    for error, _, edge in graph.in_edges(component, data=True):
+        if edge.get("type") != "INDICATES":
+            continue
+        edges.add((error, component))
+        for target, relation in graph[error].items():
+            if relation.get("type") == "FIXED_BY":
+                edges.add((error, target))
+    return edges
+
+
+def community_facts(question: str, kb: KnowledgeBase) -> dict[int, list[tuple[str, set[str]]]]:
+    """Готовит типизированные факты и суммы весов без участия модели."""
+    graph = kb.graph
+    facts: dict[int, list[tuple[str, set[str]]]] = {community.community_id: [] for community in kb.communities}
+    owners = {}
+    for community in kb.communities:
+        for node in community.nodes:
+            owners[node] = community.community_id
+
+    lines = {f"ProductLine:{name}" for kind, name in find_names(question, kb.vocabulary) if kind == "ProductLine"}
+    lines &= set(graph)
+    models = set()
+    parts = set()
+    anchors = _anchors(question, kb)
+    path_edges: set[tuple[str, str]] | None = None
+    if lines:
+        for model, line, edge in graph.edges(data=True):
+            if edge.get("type") == "BELONGS_TO" and line in lines:
+                models.add(model)
+
+        for model in models:
+            for target, edge in graph[model].items():
+                if edge.get("type") == "HAS_PART":
+                    parts.add(target)
+
+        pending = list(parts)
+        while pending:
+            part = pending.pop()
+            for target, edge in graph[part].items():
+                if edge.get("type") == "REPLACED_BY" and target not in parts:
+                    parts.add(target)
+                    pending.append(target)
+    else:
+        path_edges = _path_edges(question, kb, anchors)
+
+    for source, target, edge in sorted(graph.edges(data=True)):
+        owner = owners.get(source)
+        if owner is None:
+            continue
+        kind = edge.get("type", "")
+        if lines:
+            model_fact = source in models and kind in {"BELONGS_TO", "HAS_PART", "FAILED"}
+            part_fact = source in parts and kind in {"REPLACED_BY", "SUPPLIED_BY", "IS_A"}
+            if not model_fact and not part_fact:
+                continue
+        elif path_edges is not None and (source, target) not in path_edges:
+            continue
+        elif path_edges is None and owners.get(target) != owner:
+            if len(anchors) != 1 or anchors[0] not in (source, target):
+                continue
+        weight = edge.get("weight", 1)
+        facts[owner].append((f"{source} -{kind}-> {target} (вес {weight})", _sources(edge)))
+
+    for line in sorted(lines):
+        by_component: dict[tuple[int, str], int] = defaultdict(int)
+        by_model: dict[tuple[int, str], int] = defaultdict(int)
+        component_sources: dict[tuple[int, str], set[str]] = defaultdict(set)
+        model_sources: dict[tuple[int, str], set[str]] = defaultdict(set)
+        for model in sorted(models):
+            if not graph.has_edge(model, line) or graph.edges[model, line].get("type") != "BELONGS_TO":
+                continue
+            owner = owners.get(model)
+            if owner is None:
+                continue
+            membership = graph.edges[model, line]
+            for component, edge in graph[model].items():
+                if edge.get("type") != "FAILED":
+                    continue
+                weight = edge.get("weight", 1)
+                by_component[owner, component] += weight
+                by_model[owner, model] += weight
+                component_sources[owner, component].update(_sources(membership, edge))
+                model_sources[owner, model].update(_sources(membership, edge))
+        for (owner, component), count in sorted(by_component.items()):
+            fact = f"{line}: {component}, частичная сумма весов FAILED по моделям линейки = {count}"
+            facts[owner].append((fact, component_sources[owner, component]))
+        for (owner, model), count in sorted(by_model.items()):
+            fact = f"{line}: {model}, частичная сумма весов FAILED по узлам модели = {count}"
+            facts[owner].append((fact, model_sources[owner, model]))
+    return facts
