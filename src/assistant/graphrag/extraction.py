@@ -99,21 +99,20 @@ def _asserted_text(text: str) -> str:
         r"применя\w*|показал\w*|подтвержд\w*|доказ\w*|отказ\w*|соответству\w*)\b",
         re.I,
     )
-    reference = re.compile(
-        r"^\s*(?:однако\s*,?\s*)?(?:это|данное|предыдущее|такое|сказанное|утверждение)\b", re.I
-    )
+    reference = re.compile(r"^\s*(?:однако\s*,?\s*)?(?:это|данное|предыдущее|такое|сказанное|утверждение)\b", re.I)
     parts = re.split(r"([.!?\n])", text)
     result = []
     for index in range(0, len(parts), 2):
         sentence = parts[index]
         end = parts[index + 1] if index + 1 < len(parts) else ""
-        doubtful = uncertain.search(sentence) or negated.search(sentence) or re.search(r"\bне\s+так\b", sentence, re.I)
+        uncertain_sentence = uncertain.search(sentence) or negated.search(sentence)
+        doubtful = uncertain_sentence or re.search(r"\bне\s+так\b", sentence, re.I)
         if reference.search(sentence) and doubtful:
             for previous in range(index - 2, -1, -2):
                 if parts[previous].strip():
                     result[previous] = " "
                     break
-        result.append(" " if end == "?" or uncertain.search(sentence) or negated.search(sentence) else sentence)
+        result.append(" " if end == "?" or uncertain_sentence else sentence)
         result.append(end)
     return "".join(result)
 
@@ -195,9 +194,7 @@ def _explicit_relations(text: str, entities: dict[str, Entity], names: dict[str,
         value = next((name for name in names.get(kind, []) if name.casefold() == raw.strip().casefold()), None)
         return Entity(kind, value) if value else None
 
-    membership = re.search(
-        r"([A-Za-zА-Яа-я]+[- ]?\d{3})\s+входит в линейку\s*[«\"„“]([^»\"“”]+)[»\"“”]", text, re.I
-    )
+    membership = re.search(r"([A-Za-zА-Яа-я]+[- ]?\d{3})\s+входит в линейку\s*[«\"„“]([^»\"“”]+)[»\"“”]", text, re.I)
     if membership:
         model, line = code(membership.group(1), "Model"), named(membership.group(2), "ProductLine")
         if model and line:
@@ -227,7 +224,8 @@ def _explicit_relations(text: str, entities: dict[str, Entity], names: dict[str,
         r"деталь\s+([A-Za-zА-Яа-я]+[- ]?\d{4}[A-Za-zА-Яа-я]?)\s*(?:\([^\n)]*\)\s*)?"
         r"снята с производства\.\s*Вместо неё устанавливается деталь\s+"
         r"([A-Za-zА-Яа-я]+[- ]?\d{4}[A-Za-zА-Яа-я]?)(?![A-Za-zА-Яа-я0-9])",
-        text, re.I,
+        text,
+        re.I,
     )
     if replacement:
         old, new = (code(value, "Part") for value in replacement.groups())
@@ -235,30 +233,29 @@ def _explicit_relations(text: str, entities: dict[str, Entity], names: dict[str,
             add(old, "REPLACED_BY", new)
 
     part_code = r"(?<![A-Za-zА-Яа-я0-9])([A-Za-zА-Яа-я]+[- ]?\d{4}[A-Za-zА-Яа-я]?)(?![A-Za-zА-Яа-я0-9])"
-    for match in re.finditer(
-        rf"{part_code}\s+(?:заменяет|заменил[ао]?)\s+(?:деталь\s+)?{part_code}", text, re.I
-    ):
+    for match in re.finditer(rf"{part_code}\s+(?:заменяет|заменил[ао]?)\s+(?:деталь\s+)?{part_code}", text, re.I):
         new, old = (code(value, "Part") for value in match.groups())
         if old and new and old != new:
             add(old, "REPLACED_BY", new)
     for match in re.finditer(
         rf"{part_code}\s+(?:заменен[ао]?|заменён[ао]?|заменяется|заменили)\s+"
-        rf"(?:на\s+(?:деталь\s+)?|деталью\s+){part_code}", text, re.I
+        rf"(?:на\s+(?:деталь\s+)?|деталью\s+){part_code}",
+        text,
+        re.I,
     ):
         old, new = (code(value, "Part") for value in match.groups())
         if old and new and old != new:
             add(old, "REPLACED_BY", new)
 
-    for match in re.finditer(
-        r"детал[ьи]\s+([A-Za-zА-Яа-я]+[- ]?\d{4}[A-Za-zА-Яа-я]?)\s*\(([^()\n]+)\)", text, re.I
-    ):
+    for match in re.finditer(r"детал[ьи]\s+([A-Za-zА-Яа-я]+[- ]?\d{4}[A-Za-zА-Яа-я]?)\s*\(([^()\n]+)\)", text, re.I):
         part, component = code(match.group(1), "Part"), named(match.group(2), "Component")
         if part and component:
             add(part, "IS_A", component, require_both=False)
 
     for match in re.finditer(
         r"поставщик детали\s+([A-Za-zА-Яа-я]+[- ]?\d{4}[A-Za-zА-Яа-я]?)\s*[–—-]\s*[«\"„“]([^»\"“”]+)[»\"“”]",
-        text, re.I,
+        text,
+        re.I,
     ):
         part, supplier = code(match.group(1), "Part"), named(match.group(2), "Supplier")
         if part and supplier:
@@ -267,7 +264,8 @@ def _explicit_relations(text: str, entities: dict[str, Entity], names: dict[str,
     defect = re.search(
         r"поставщик\s*[«\"„“]([^»\"“”]+)[»\"“”]\s+сообщил о дефекте партии детали\s+"
         r"([A-Za-zА-Яа-я]+[- ]?\d{4}[A-Za-zА-Яа-я]?)(?![A-Za-zА-Яа-я0-9])",
-        text, re.I,
+        text,
+        re.I,
     )
     if defect:
         supplier, part = named(defect.group(1), "Supplier"), code(defect.group(2), "Part")
@@ -276,7 +274,8 @@ def _explicit_relations(text: str, entities: dict[str, Entity], names: dict[str,
 
     for match in re.finditer(
         r"^\s*-\s*([A-Za-zА-Яа-я]+[- ]?\d{2})\s*[–—-][^\n]*?отказ узла\s*[«\"„“]([^»\"“”]+)[»\"“”]",
-        text, re.I | re.M,
+        text,
+        re.I | re.M,
     ):
         error, component = code(match.group(1), "ErrorCode"), named(match.group(2), "Component")
         if error and component:
@@ -284,7 +283,8 @@ def _explicit_relations(text: str, entities: dict[str, Entity], names: dict[str,
 
     for match in re.finditer(
         r"ошибка\s+([A-Za-zА-Яа-я]+[- ]?\d{2})\s+указывает на отказ узла\s*[«\"„“]([^»\"“”]+)[»\"“”]",
-        text, re.I,
+        text,
+        re.I,
     ):
         error, component = code(match.group(1), "ErrorCode"), named(match.group(2), "Component")
         if error and component:
@@ -293,7 +293,8 @@ def _explicit_relations(text: str, entities: dict[str, Entity], names: dict[str,
     procedure = re.search(
         r"регламент\s+([A-Za-zА-Яа-я]+[- ]?\d{3})\s+применяется при ошибке\s+"
         r"([A-Za-zА-Яа-я]+[- ]?\d{2})(?![A-Za-zА-Яа-я0-9])",
-        text, re.I,
+        text,
+        re.I,
     )
     if procedure:
         repair, error = code(procedure.group(1), "Procedure"), code(procedure.group(2), "ErrorCode")
