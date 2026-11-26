@@ -38,9 +38,71 @@ def anchor_paths(question: str, kb: KnowledgeBase) -> list[list[str]]:
     """Находит короткие пути между известными опорами без учёта направления."""
     undirected = kb.graph.to_undirected()
     paths = []
-    for start, end in combinations(_anchors(question, kb), 2):
+    anchors = _anchors(question, kb)
+    for start, end in combinations(anchors, 2):
         paths.extend(nx.all_simple_paths(undirected, start, end, cutoff=3))
+
+    # Для поиска детали важна связь установленной детали с видом нужного узла.
+    # Пути через другие модели и общую линейку добавляют посторонние детали.
+    has_model = any(node.startswith("Model:") for node in anchors)
+    has_target = any(node.startswith(("Component:", "ErrorCode:")) for node in anchors)
+    if len(anchors) == 2 and has_model and has_target and re.search(r"детал|постав|заказ", question.lower()):
+        relevant = []
+        for path in paths:
+            kinds = set()
+            for first, second in zip(path, path[1:], strict=False):
+                if kb.graph.has_edge(first, second):
+                    kinds.add(kb.graph.edges[first, second].get("type"))
+                if kb.graph.has_edge(second, first):
+                    kinds.add(kb.graph.edges[second, first].get("type"))
+            if {"HAS_PART", "IS_A"} <= kinds:
+                relevant.append(path)
+        if relevant:
+            return relevant
     return paths
+
+
+def _path_edges(question: str, kb: KnowledgeBase, anchors: list[str]) -> set[tuple[str, str]] | None:
+    """Собирает связи на путях и связанные с ними замены и регламенты."""
+    graph = kb.graph
+    if len(anchors) >= 2:
+        edges = set()
+        nodes = set()
+        for path in anchor_paths(question, kb):
+            nodes.update(path)
+            for first, second in zip(path, path[1:], strict=False):
+                if graph.has_edge(first, second):
+                    edges.add((first, second))
+                if graph.has_edge(second, first):
+                    edges.add((second, first))
+
+        pending = [node for node in nodes if graph.nodes[node].get("type") == "Part"]
+        visited = set()
+        while pending:
+            part = pending.pop()
+            if part in visited:
+                continue
+            visited.add(part)
+            for target, edge in graph[part].items():
+                if edge.get("type") == "REPLACED_BY":
+                    edges.add((part, target))
+                    pending.append(target)
+                elif edge.get("type") == "SUPPLIED_BY" and "постав" in question.lower():
+                    edges.add((part, target))
+        return edges
+
+    component = procedure_component(question, kb)
+    if not component:
+        return None
+    edges = set()
+    for error, _, edge in graph.in_edges(component, data=True):
+        if edge.get("type") != "INDICATES":
+            continue
+        edges.add((error, component))
+        for target, relation in graph[error].items():
+            if relation.get("type") == "FIXED_BY":
+                edges.add((error, target))
+    return edges
 
 
 def community_facts(question: str, kb: KnowledgeBase) -> dict[int, list[tuple[str, set[str]]]]:
@@ -56,6 +118,7 @@ def community_facts(question: str, kb: KnowledgeBase) -> dict[int, list[tuple[st
     lines &= set(graph)
     models = set()
     parts = set()
+    anchors = _anchors(question, kb)
     path_edges: set[tuple[str, str]] | None = None
     if lines:
         for model, line, edge in graph.edges(data=True):
@@ -75,40 +138,7 @@ def community_facts(question: str, kb: KnowledgeBase) -> dict[int, list[tuple[st
                     parts.add(target)
                     pending.append(target)
     else:
-        anchors = _anchors(question, kb)
-        component = procedure_component(question, kb)
-        if len(anchors) >= 2:
-            path_edges = set()
-            path_nodes = set()
-            for path in anchor_paths(question, kb):
-                path_nodes.update(path)
-                for first, second in zip(path, path[1:], strict=False):
-                    if graph.has_edge(first, second):
-                        path_edges.add((first, second))
-                    if graph.has_edge(second, first):
-                        path_edges.add((second, first))
-            pending = [node for node in path_nodes if graph.nodes[node].get("type") == "Part"]
-            visited = set()
-            while pending:
-                part = pending.pop()
-                if part in visited:
-                    continue
-                visited.add(part)
-                for target, edge in graph[part].items():
-                    if edge.get("type") == "REPLACED_BY":
-                        path_edges.add((part, target))
-                        pending.append(target)
-                    elif edge.get("type") == "SUPPLIED_BY" and "постав" in question.lower():
-                        path_edges.add((part, target))
-        elif component:
-            path_edges = set()
-            for error, _, edge in graph.in_edges(component, data=True):
-                if edge.get("type") != "INDICATES":
-                    continue
-                path_edges.add((error, component))
-                for target, relation in graph[error].items():
-                    if relation.get("type") == "FIXED_BY":
-                        path_edges.add((error, target))
+        path_edges = _path_edges(question, kb, anchors)
 
     for source, target, edge in sorted(graph.edges(data=True)):
         owner = owners.get(source)
@@ -123,7 +153,8 @@ def community_facts(question: str, kb: KnowledgeBase) -> dict[int, list[tuple[st
         elif path_edges is not None and (source, target) not in path_edges:
             continue
         elif path_edges is None and owners.get(target) != owner:
-            continue
+            if len(anchors) != 1 or anchors[0] not in (source, target):
+                continue
         weight = edge.get("weight", 1)
         facts[owner].append((f"{source} -{kind}-> {target} (вес {weight})", _sources(edge)))
 

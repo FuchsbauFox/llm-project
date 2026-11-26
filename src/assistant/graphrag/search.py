@@ -88,11 +88,15 @@ def _model_answer(content: str, sources: set[str], facts: list[str] | None = Non
     refused = False
     try:
         data = json.loads(content)
-        if isinstance(data, dict) and isinstance(data.get("answer"), str) and type(data.get("refused")) is bool:
-            text = data["answer"].strip()
-            refused = data["refused"]
     except (ValueError, TypeError):
         pass
+    else:
+        if not isinstance(data, dict):
+            return _refusal()
+        if not isinstance(data.get("answer"), str) or type(data.get("refused")) is not bool:
+            return _refusal()
+        text = data["answer"].strip()
+        refused = data["refused"]
     if not text:
         return _refusal()
     # Запасной вариант для неструктурированного ответа не должен отбрасывать частичный ответ.
@@ -119,6 +123,13 @@ def _check_supplier(question: str, answer: Answer, kb: KnowledgeBase) -> Answer:
                 if data.get("type") == "REPLACED_BY" and target not in candidates:
                     candidates.add(target)
                     pending.append(target)
+
+        # Поставщик старой детали не обязательно поставляет её замену.
+        candidates = {
+            node
+            for node in candidates
+            if not any(data.get("type") == "REPLACED_BY" for data in kb.graph[node].values())
+        }
     supplier_edges = []
     for node in candidates:
         for target, data in kb.graph[node].items():
@@ -158,7 +169,7 @@ def _check_global_claims(answer: Answer) -> Answer:
             r"устраняется|применяется)\b",
             sentence,
         )
-        discontinued = re.search(r"\bснят[а-яё]*\s+с\s+производств", sentence)
+        discontinued = re.search(r"\bснят(?:а|о|ы)?\s+с\s+производств", sentence)
         if negative or discontinued:
             return _refusal()
     return answer
@@ -194,9 +205,19 @@ def _check_global_component_suppliers(question: str, answer: Answer, kb: Knowled
     models = {f"Model:{code}" for code in find_codes(question) if code_type(code) == "Model"}
     components = {f"Component:{name}" for kind, name in find_names(question, kb.vocabulary) if kind == "Component"}
     suppliers = {f"Supplier:{name}" for kind, name in find_names(answer.text, kb.vocabulary) if kind == "Supplier"}
-    if len(models) != 1 or len(components) != 1 or not suppliers:
+    if len(models) != 1 or not suppliers:
         return answer
     edges = _selected_edges(answer)
+    if not components:
+        errors = {f"ErrorCode:{code}" for code in find_codes(question) if code_type(code) == "ErrorCode"}
+        if len(errors) != 1:
+            return answer
+        components = {target for source, kind, target in edges if source in errors and kind == "INDICATES"}
+        if not components:
+            return _refusal()
+    elif len(components) != 1:
+        return answer
+
     installed = {target for source, kind, target in edges if source in models and kind == "HAS_PART"}
     parts = {
         source for source, kind, target in edges if source in installed and kind == "IS_A" and target in components
@@ -257,6 +278,8 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
                 if data.get("type") == "REPLACED_BY":
                     edges.add((node, target))
                     pending.append(target)
+                elif data.get("type") == "SUPPLIED_BY" and "постав" in question.lower():
+                    edges.add((node, target))
 
     # Замены идут первыми, чтобы они не потерялись при ограничении контекста.
     ordered = sorted(edges, key=lambda edge: (graph.edges[edge].get("type") != "REPLACED_BY", edge))
@@ -323,23 +346,72 @@ def _add_comparison_totals(partials: list[str]) -> None:
         partials.append(f"{line}: {entity}, сумма принятых частичных весов FAILED {scope} = {count}")
 
 
+def _reduce_prompt(question: str, partials: list[str]) -> str:
+    """Собирает запрос для объединения принятых фактов."""
+    question_lower = question.lower()
+    prompt = (
+        "Ответь по фактам, объединив частичные ответы. Направление связей важно: "
+        "Part — деталь, Model — модель, Component — вид узла; не смешивай эти типы. "
+        "REPLACED_BY направлена от старой детали к новой. "
+        "INDICATES означает, что ошибка указывает на узел, а не наоборот. "
+        "Для регламента узла нужны обе связи одной ошибки: INDICATES и FIXED_BY. "
+        "Если спрашивают актуальную деталь, проследи все принятые связи REPLACED_BY до конца цепочки. "
+        "Замена сама по себе не подтверждает отдельную связь IS_A или SUPPLIED_BY новой детали. "
+        "Вес относится к связи и равен числу подтверждающих чанков, а не является свойством узла. "
+        "FAILED означает отказ узла в модели, а не снятие детали с производства. "
+        "FAILED не означает, что узел отсутствует в модели. Отсутствие связи в данных не доказывает "
+        "отрицательного факта: не утверждай, что деталь не установлена или регламент не применяется. "
+        "В графе нет отдельного признака снятия с производства: REPLACED_BY подтверждает только замену. "
+        "Более частые отказы не означают большую отказоустойчивость. "
+        "Не приписывай поставщика другой детали и не смешивай линейки. "
+        "Для принадлежности детали линейке нужны связи модели с деталью и линейкой. "
+        "Суммы весов FAILED подсчитаны кодом только по принятым фактам, которые могут быть неполными; "
+        "не считай число моделей вместо весов и не утверждай полноту данных. "
+        "Поиск не оформляет заказы и не знает остатки и цены; не подтверждай заказ и не указывай количество. "
+        "Отвечай кратко, используя только необходимые подтверждённые факты, без дополнительных предположений. "
+        "Не придумывай связи. Верни JSON: answer — текст, refused=true только если ответить совсем невозможно; "
+        "если известна часть ответа, укажи её и ограничения, refused=false.\n"
+        f"Вопрос: {question}\nЧастичные ответы:\n" + "\n".join(partials)
+    )
+    if "постав" in question_lower and re.search(r"сейчас|текущ|актуальн|замен", question_lower):
+        prompt += (
+            "\nЕсли известна цепочка замен, назови поставщика последней детали в цепочке. "
+            "Поставщик старой детали может отличаться. Модель может быть связана со старой деталью, "
+            "а применимость новой подтверждается цепочкой замен."
+        )
+    elif "детал" in question_lower and re.search(r"сейчас|текущ|актуальн", question_lower):
+        prompt += (
+            "\nНазови текущую деталь и цепочку её замен. Не приписывай каждой детали отдельную связь IS_A, "
+            "если она прямо не указана в фактах."
+        )
+    if re.search(r"модел", question_lower) and re.search(r"снят[а-яё]*\s+с\s+производств", question_lower):
+        prompt += (
+            "\nСведения о снятии с производства в вопросе не подтверждены графом. "
+            "Не повторяй и не подтверждай их; ответь только на вопрос по имеющимся связям."
+        )
+    if re.search(r"регламент|процедур", question_lower):
+        prompt += "\nСвязь FIXED_BY означает, что ошибку устраняют по регламенту; не называй это фиксацией ошибки."
+    return prompt
+
+
 def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     """Объединяет полезные ответы модели на отдельные сводки сообществ."""
     partials: list[str] = []
     sources: set[str] = set()
+    question_lower = question.lower()
     evidence = community_facts(question, kb)
     unknown_code = any(f"{code_type(code)}:{code}" not in kb.graph for code in find_codes(question))
-    comparison = re.search(r"чаще|реже|больше|меньше|наибол|наимен|частот|сравн", question.lower())
+    comparison = re.search(r"чаще|реже|больше|меньше|наибол|наимен|частот|сравн", question_lower)
     names = find_names(question, kb.vocabulary)
     has_product_line = any(kind == "ProductLine" for kind, _ in names)
     path_search = len(find_codes(question)) + len(names) >= 2 and not has_product_line
     paths = anchor_paths(question, kb) if path_search else []
     procedure_search = procedure_component(question, kb) is not None
     statistic = ""
-    if comparison and re.search(r"отказ|неисправ", question.lower()):
-        if re.search(r"\bмодел[а-яё]*", question.lower()):
+    if comparison and re.search(r"отказ|неисправ", question_lower):
+        if re.search(r"\bмодел[а-яё]*", question_lower):
             statistic = "частичная сумма весов FAILED по узлам модели"
-        elif re.search(r"\b(?:узел|узла|узлы|узлов|узле|узлом|компонент[а-яё]*)\b", question.lower()):
+        elif re.search(r"\b(?:узел|узла|узлы|узлов|узле|узлом|компонент[а-яё]*)\b", question_lower):
             statistic = "частичная сумма весов FAILED по моделям линейки"
     relevant_statistics: set[int] = set()
     accepted_statistics: set[int] = set()
@@ -349,7 +421,7 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         if grounded:
             # Связи одного сообщества на одном пути предлагаются как единый факт-пакет:
             # модель не теряет замену, выбрав только одно звено принятого сообщества.
-            if ((path_search and paths) or procedure_search) and available:
+            if (paths or procedure_search) and available:
                 available = _bundle_facts(available)
             elif statistic:
                 selected = [(fact, documents) for fact, documents in available if statistic in fact]
@@ -371,21 +443,20 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
                 prompt += "\nДля сравнения выбери все подходящие суммы, а не только наибольшую."
                 if statistic:
                     prompt += " Здесь единственный допустимый номер пакета — 1; выбери его целиком."
-            if path_search and paths and available:
+            if paths and available:
                 prompt += (
                     "\nЭти факты лежат на путях между сущностями вопроса или в цепочках замен деталей. "
                     "Здесь единственный допустимый номер пакета — 1; он обозначает все связи данного сообщества. "
                     "Выбери пакеты, необходимые для соединения сущностей и определения актуальной детали."
                 )
-                if "постав" in question.lower():
+                if "постав" in question_lower:
                     prompt += " В пакет также включены подтверждённые связи деталей с поставщиками."
-                if paths:
-                    prompt += (
-                        "\nПути опор (порядок соседства, не направление связей):\n"
-                        + "\n".join(" ↔ ".join(path) for path in paths)
-                        + "\nПути служат только контекстом. Выбирай исключительно номера проверенных фактов этого "
-                        "сообщества; если их нет, верни score 0."
-                    )
+                prompt += (
+                    "\nПути опор (порядок соседства, не направление связей):\n"
+                    + "\n".join(" ↔ ".join(path) for path in paths)
+                    + "\nПути служат только контекстом. Выбирай исключительно номера проверенных фактов этого "
+                    "сообщества; если их нет, верни score 0."
+                )
             elif procedure_search and available:
                 prompt += (
                     "\nПакет содержит связи ошибки с указанным узлом и её регламентом. "
@@ -426,30 +497,7 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         return _refusal()
     if comparison:
         _add_comparison_totals(partials)
-    prompt = (
-        "Ответь по фактам, объединив частичные ответы. Направление связей важно: "
-        "Part — деталь, Model — модель, Component — вид узла; не смешивай эти типы. "
-        "REPLACED_BY направлена от старой детали к новой. "
-        "INDICATES означает, что ошибка указывает на узел, а не наоборот. "
-        "Для регламента узла нужны обе связи одной ошибки: INDICATES и FIXED_BY. "
-        "Если спрашивают актуальную деталь, проследи все принятые связи REPLACED_BY до конца цепочки. "
-        "Замена сама по себе не подтверждает отдельную связь IS_A или SUPPLIED_BY новой детали. "
-        "Вес относится к связи и равен числу подтверждающих чанков, а не является свойством узла. "
-        "FAILED означает отказ узла в модели, а не снятие детали с производства. "
-        "FAILED не означает, что узел отсутствует в модели. Отсутствие связи в данных не доказывает "
-        "отрицательного факта: не утверждай, что деталь не установлена или регламент не применяется. "
-        "В графе нет отдельного признака снятия с производства: REPLACED_BY подтверждает только замену. "
-        "Более частые отказы не означают большую отказоустойчивость. "
-        "Не приписывай поставщика другой детали и не смешивай линейки. "
-        "Для принадлежности детали линейке нужны связи модели с деталью и линейкой. "
-        "Суммы весов FAILED подсчитаны кодом только по принятым фактам, которые могут быть неполными; "
-        "не считай число моделей вместо весов и не утверждай полноту данных. "
-        "Поиск не оформляет заказы и не знает остатки и цены; не подтверждай заказ и не указывай количество. "
-        "Отвечай кратко, используя только необходимые подтверждённые факты, без дополнительных предположений. "
-        "Не придумывай связи. Верни JSON: answer — текст, refused=true только если ответить совсем невозможно; "
-        "если известна часть ответа, укажи её и ограничения, refused=false.\n"
-        f"Вопрос: {question}\nЧастичные ответы:\n" + "\n".join(partials)
-    )
+    prompt = _reduce_prompt(question, partials)
     response = llm.chat([{"role": "user", "content": prompt}], json_schema=ANSWER_SCHEMA)
     answer = _model_answer(response.content, sources, partials)
     if all(_grounded_summary(community.summary) for community in kb.communities):
